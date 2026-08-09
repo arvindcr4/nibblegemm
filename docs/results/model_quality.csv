@@ -1,4 +1,5 @@
 impl,weights GiB,perplexity,decode tok/s,notes
-fp16,2.05,11.355,39.7,
-INT4 max-abs RTN,0.71,12.76,41.6,154 layers quantised
-INT4 + clip search,0.71,13.947,37.6,154 layers quantised
+fp16,2.05,11.355,38.3,
+INT4 max-abs RTN,0.71,12.76,41.2,154 layers quantised
+INT4 + clip search,0.71,13.947,41.0,154 layers quantised
+INT4 + GPTQ,0.71,12.103,41.3,154 layers quantised

@@ -436,6 +436,76 @@ dispatch dominates and the fp16/INT4 decode rates are within noise of each
 other. That is not a kernel result, it is a framework one — and it is the reason
 the speed measurement above is done at 8B scale with CUDA graphs.
 
+### GPTQ: optimise the output, not the weights
+
+The clipping search failed because it optimised weight error. The fix is to
+optimise the thing that actually moved: error at the layer's *output*, under the
+real activation distribution.
+
+GPTQ quantises along the input dimension in order and, after fixing each column,
+pushes its rounding error onto the columns not yet quantised, weighted by the
+inverse Hessian `H = 2 XᵀX` of calibration activations. An error introduced in
+one weight is then partly cancelled by a deliberate counter-error later.
+
+Two reasons it was the right choice over AWQ:
+
+* **The format does not change.** GPTQ emits different *values* in the same
+  packed INT4 layout, so the kernel, the packing and every existing test are
+  untouched. AWQ instead rescales input channels and needs the reciprocal folded
+  into an adjacent layer — model surgery for no kernel benefit.
+* **It attacks the metric that regressed.** Its objective is output error, which
+  is what perplexity responds to.
+
+Implementation notes worth recording. Blocks are processed one decoder layer at
+a time, and each block's linears are replaced *before* the next block is
+calibrated — so block *i+1* sees the activations the quantised model will really
+produce, and its compensation partly absorbs the drift accumulated upstream. The
+Hessian is accumulated through forward hooks, so activations are never stored:
+`H` is `[K, K]` no matter how many calibration tokens pass through. Calibration
+text is taken from a slice disjoint from the perplexity window, because
+calibrating on the evaluation text would make GPTQ look better than it is.
+
+**Layer level**, on synthetic weights with correlated activations and realistic
+outliers:
+
+| K x N | output MSE, RTN | output MSE, GPTQ | ratio | weight MSE, RTN | weight MSE, GPTQ |
+|---|---|---|---|---|---|
+| 512x256 | 0.0519 | 0.0178 | 2.91x | 1.06e-5 | 4.63e-5 |
+| 2048x512 | 0.8629 | 0.2527 | 3.41x | 1.22e-5 | 4.94e-5 |
+| 4096x1024 | 3.4727 | 0.8030 | 4.32x | 1.24e-5 | 4.66e-5 |
+
+Output error improves 2.9–4.3x while weight error gets roughly **4x worse**.
+That is the clipping-search lesson restated from the other side, and it is the
+cleanest possible demonstration that weight MSE was never the objective:
+optimising it hurt the model, and sacrificing it helped.
+
+**Model level**, TinyLlama-1.1B:
+
+| | perplexity | vs fp16 | share of RTN's damage recovered |
+|---|---|---|---|
+| fp16 | 11.355 | — | — |
+| RTN | 12.760 | +12.4% | — |
+| clip search | 13.947 | +22.8% | negative |
+| **GPTQ** | **12.103** | **+6.6%** | **47%** |
+
+GPTQ varies slightly between runs (12.10–12.20, i.e. +6.6% to +7.4%, recovering
+40–47%) because the calibration forward passes use non-deterministic cuBLAS
+reductions, so the accumulated Hessian differs a little each time. The table
+records the run committed to `docs/results/model_quality.csv`; the range is
+stated here rather than quietly reporting the better number.
+
+`tests/test_gptq.py` asserts the trade in both directions — output error must
+improve, weight error must regress — so a future "improvement" that optimises
+the proxy fails the suite instead of quietly degrading the model.
+
+**A bug the tests caught.** `torch.linalg.cholesky(A, upper=True)` can return a
+tensor with stale non-zeros *below* the diagonal: LAPACK's `potrf` writes only
+the triangle it was asked for and leaves the other half alone. The algorithm
+reads only on-or-above-diagonal entries, so no result was wrong — but a function
+documented to return an upper-triangular factor should return one, rather than
+leaving the invariant for the next reader to rediscover. It now applies `triu`
+explicitly, and a test pins it.
+
 ---
 
 ## What would come next

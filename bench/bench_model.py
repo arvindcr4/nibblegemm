@@ -203,21 +203,45 @@ def model_mode(args):
     ids = tok(text, return_tensors="pt").input_ids[:, : args.tokens]
     print(f"eval stream: {ids.size(1)} tokens from {source or 'synthetic filler'}")
 
-    # Both quantiser settings are evaluated so the table separates the kernel's
-    # error (nil -- it is bit-exact) from the quantisation scheme's.
+    # Calibration comes from a slice after the evaluation window. Calibrating on
+    # the text perplexity is then measured on would leak, and GPTQ would look
+    # better than it is.
+    all_ids = tok(text, return_tensors="pt").input_ids
+    calib_start = args.tokens
+    need = args.calib_seqs * args.calib_seqlen
+    calib_pool = all_ids[:, calib_start:calib_start + need]
+    calib = [calib_pool[:, i:i + args.calib_seqlen]
+             for i in range(0, calib_pool.size(1) - args.calib_seqlen + 1, args.calib_seqlen)]
+    print(f"calibration: {len(calib)} x {args.calib_seqlen} tokens, "
+          f"disjoint from the eval window")
+
+    # Every variant is evaluated so the table separates the kernel's error
+    # (nil -- it is bit-exact) from the quantiser's.
     variants = [
         ("fp16", None),
-        ("INT4 max-abs RTN", False),
-        ("INT4 + clip search", True),
+        ("INT4 max-abs RTN", "rtn"),
+        ("INT4 + clip search", "clip"),
+        ("INT4 + GPTQ", "gptq"),
     ]
 
     rows = []
-    for label, clip in variants:
+    for label, kind in variants:
         model = AutoModelForCausalLM.from_pretrained(
             args.model, dtype=torch.float16).to("cuda").eval()
         note = ""
-        if clip is not None:
-            n, skipped = swap_linears(model, args.group_size, clip_search=clip)
+        if kind == "gptq":
+            if not calib:
+                print("  [no calibration text available, skipping GPTQ]", file=sys.stderr)
+                del model
+                continue
+            n, skipped = ng.quantize_model_gptq(
+                model, calib, group_size=args.group_size, log=lambda _m: None)
+            note = f"{n} layers quantised"
+            if skipped:
+                note += f", {len(skipped)} skipped (shape)"
+            torch.cuda.empty_cache()
+        elif kind is not None:
+            n, skipped = swap_linears(model, args.group_size, clip_search=(kind == "clip"))
             note = f"{n} layers quantised"
             if skipped:
                 note += f", {len(skipped)} skipped (shape)"
@@ -296,6 +320,8 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=4096)
     ap.add_argument("--window", type=int, default=1024)
     ap.add_argument("--new-tokens", type=int, default=64)
+    ap.add_argument("--calib-seqs", type=int, default=32)
+    ap.add_argument("--calib-seqlen", type=int, default=512)
     ap.add_argument("--skip-perplexity", action="store_true",
                     help="throughput only; use when no real evaluation text is reachable")
     args = ap.parse_args()

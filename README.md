@@ -62,28 +62,35 @@ stack lands slightly under the best single-shape number because a decode step is
 a *mix*: the narrow GQA k/v projections (4096×1024) and the 4096×4096 q/o
 projections are the shapes that sit furthest from peak.
 
-**Quality**, on a real checkpoint (TinyLlama-1.1B, perplexity over 4096 tokens
-of held-out prose):
+**Quality**, on a real checkpoint (TinyLlama-1.1B, all 154 decoder projections
+quantised, perplexity over 4096 tokens of held-out prose):
 
 | | weights | perplexity | vs fp16 |
 |---|---|---|---|
 | fp16 | 2.05 GiB | 11.355 | — |
-| INT4 (max-abs RTN) | 0.71 GiB | 12.760 | +12.4% |
-| INT4 + MSE clip search | 0.71 GiB | 13.947 | +22.8% |
+| INT4, round-to-nearest | 0.71 GiB | 12.760 | +12.4% |
+| INT4, MSE clip search | 0.71 GiB | 13.947 | +22.8% |
+| **INT4, GPTQ** | **0.71 GiB** | **12.103** | **+6.6%** |
 
 The kernel contributes **none** of that error — it is bit-exact against the
-reference. All 12.4% is the quantisation *scheme*: round-to-nearest with no
-calibration, which is the weakest algorithm in the family. GPTQ or AWQ weights
-would slot into the same kernel unchanged and recover most of it.
+reference. All of it is the quantisation *scheme*, which is why the fix was an
+algorithm rather than a kernel change: [GPTQ](python/nibblegemm/gptq.py)
+recovers 40-47% of what round-to-nearest gives away (it varies a
+little between runs; see the log), at 2.9x less weight memory
+and with **not one line of CUDA modified**. That was the reason to implement
+GPTQ rather than AWQ — it emits the same packed format, so the kernel, the
+packing and the tests are all untouched, whereas AWQ rescales input channels
+and needs the reciprocal folded into an adjacent layer.
 
-That third row is a negative result worth keeping. Searching clipping ratios to
-minimise weight MSE **cut weight RMSE by 12% and made the model 23% worse**,
-because a squared-error criterion is happiest to clip exactly the
-large-magnitude weights transformer outputs depend on. It is a clean
-demonstration of why AWQ weights error by *activation* magnitude and GPTQ uses
-second-order information: weight error is a proxy, and optimising the proxy
-moved the real metric the wrong way. The search is still in the code, off by
-default.
+**Two rows of that table are the same lesson from opposite directions.**
+Searching clipping ratios to minimise weight MSE cut weight RMSE by 12% and made
+the model *worse* (+22.8%). GPTQ does the reverse: it makes weight MSE about 4x
+**worse** on purpose, and cuts layer-output MSE by 2.9–4.3x, because an error
+introduced in one column can be cancelled by nudging the columns not yet
+quantised. Weight error is a proxy; optimising it moved the real metric the
+wrong way, and deliberately sacrificing it moved the real metric the right way.
+`tests/test_gptq.py` asserts both directions, so a future change that "improves"
+weight error will fail the suite rather than quietly degrade the model.
 
 One caveat stated plainly: the 1.1B decode-throughput numbers in that run are
 overhead-dominated — at 22 layers in eager HuggingFace, Python dispatch swamps
@@ -167,12 +174,17 @@ that separates launch overhead from kernel time.
 - **Error attributed to quantisation, not the kernel**: `QuantLinear` tests
   assert the kernel contributes under 0.1% while INT4 quantisation itself
   contributes ~10%.
+- **The GPTQ trade asserted in both directions** — output error must improve,
+  weight error must regress. A change that optimised the proxy would fail.
 - Edge shapes (M and N not multiples of the block tile), every split-K width,
   and both group sizes.
 
 ```bash
-python -m pytest tests/ -q     # 173 passed
+python -m pytest tests/ -q     # 191 passed
 ```
+
+18 of these run on CPU with no GPU at all (packing format, GPTQ linear algebra),
+which is what makes the algorithm work testable from a laptop.
 
 ---
 
@@ -250,10 +262,13 @@ X  = torch.randn(1, 4096, dtype=torch.float16, device="cuda")
 Y = ng.matmul(X, qw)                           # dispatches on batch size
 ```
 
-Swap it into a model:
+Swap it into a model, either layer by layer or with GPTQ across the whole thing:
 
 ```python
 qlinear = ng.QuantLinear.from_linear(model.mlp.gate_proj, group_size=128)
+
+# or, error-compensated with calibration data (same packed format, same kernel):
+n_quantised, skipped = ng.quantize_model_gptq(model, calibration_batches, group_size=128)
 ```
 
 Reproduce the numbers:
@@ -265,7 +280,7 @@ python bench/bench_prefill.py        # tensor-core path + crossover sweep
 python bench/autotune.py             # split-K / block-width sweep
 python bench/launch_overhead.py      # eager vs CUDA graph
 python bench/bench_model.py layers   # decode step at Llama-3-8B scale
-python bench/bench_model.py model    # perplexity on a real checkpoint
+python bench/bench_model.py model    # perplexity: fp16 vs RTN vs GPTQ
 ```
 
 No local GPU? [`tools/colab_run.py`](tools/colab_run.py) ships the working tree
@@ -281,9 +296,9 @@ csrc/dequant.cuh        the lop3 bit-trick decode, with the derivation
 csrc/mma.cuh            mma.sync / ldmatrix wrappers + the fragment layouts
 csrc/gemv_w4a16.cu      decode kernels v0-v4
 csrc/gemm_w4a16.cu      prefill kernels v6 (wmma) and v7 (mma.sync)
-python/nibblegemm/      quantiser (defines the on-device format), ops, Triton baseline
+python/nibblegemm/      quantiser (defines the format), GPTQ, ops, Triton baseline
 bench/                  harness, kernel benchmarks, end-to-end model benchmark
-tests/                  173 tests
+tests/                  191 tests
 docs/OPTIMIZATION_LOG.md   every measurement, including the ones that disproved me
 ```
 

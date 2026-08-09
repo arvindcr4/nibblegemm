@@ -1,0 +1,7 @@
+# The CUDA extension is JIT-built by torch.utils.cpp_extension, which needs ninja.
+torch>=2.1
+numpy
+ninja
+pytest
+# Optional: only needed for the Triton comparison baseline in bench/.
+# triton>=3.0

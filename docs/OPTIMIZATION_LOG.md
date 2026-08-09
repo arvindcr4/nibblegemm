@@ -190,20 +190,26 @@ A 64x64 tile gives 51 FLOP/byte. The A100 needs roughly
 The first version measured **73.8 TFLOP/s** — its roofline, not a defect. No
 inner-loop tuning would have moved it.
 
-Doubling to a 128x128 tile doubles intensity to 102 FLOP/byte, predicting
+What follows is four hypotheses about the remaining gap, in the order they were
+tested. Two were right. Shape 4096x4096, M=4096.
+
+| # | hypothesis | outcome | TFLOP/s |
+|---|---|---|---|
+| — | starting point (64x64 tile) | — | 73.8 |
+| 1 | the tile is too small — intensity caps it | **confirmed** | 100.1 |
+| 2 | wmma's addressing overhead is the limit | **disproved** | 100.1 |
+| 3 | a runtime integer division is on the hot path | **confirmed** | 111.7 |
+| 4 | 64-bit address arithmetic still costs | instructions down 9%, **no speedup** | 111.7 |
+
+### 1. Tile size — confirmed
+
+Doubling to 128x128 doubles intensity to 102 FLOP/byte, predicting
 ~143 TFLOP/s. `BK` dropped to 32 to keep both double-buffered tiles inside the
-48 KB shared-memory budget, which costs nothing since `BK` cancels out above.
+48 KB shared-memory budget, which costs nothing since `BK` cancels above.
 
-| tile | predicted ceiling | measured (4096x4096, M=4096) |
-|---|---|---|
-| 64x64 | ~71 TFLOP/s | 73.8 TFLOP/s |
-| 128x128 | ~143 TFLOP/s | **100.1 TFLOP/s** |
-
-The prediction held for the small tile and was optimistic for the large one:
+Measured 100.1 TFLOP/s: the direction was right, the magnitude optimistic —
 1.36x gained against 1.95x predicted, landing at 70% of the new ceiling. `ncu`
-says why.
-
-### Why the prefill kernel stops at 70% of its roofline
+was the obvious next step:
 
 ```
 launch__registers_per_thread                    128
@@ -212,38 +218,129 @@ sm__inst_executed_pipe_tensor.sum         33,554,432
 smsp__inst_executed.sum                  319,463,424
 ```
 
-**About 9.5 non-tensor instructions issue for every tensor instruction.** The
-kernel is issue-bound on overhead — address arithmetic, shared-memory loads,
-loop bookkeeping — not on math. 128 registers per thread at 256 threads means
-exactly 2 blocks per SM, which is where the 24.5% occupancy comes from.
+**9.5 non-tensor instructions per tensor instruction.** The kernel was issue-bound
+on overhead, not math.
 
-The cause is the wmma API. `load_matrix_sync` recomputes fragment addressing on
-every call and gives no control over shared-memory swizzling, so a large share
-of the instruction stream is overhead wmma will not let the kernel remove. That
-is the acknowledged cost of using it: correct by construction, with a ceiling.
+### 2. wmma is the overhead — disproved
 
-**Honest framing of the prefill numbers.** The fused kernel reaches 39% of
-cuBLAS fp16. Dequantising to fp16 and calling cuBLAS reaches 99%. At prefill,
-dequant-then-cuBLAS is the better engineering choice on time alone, and the
-fused kernel earns its place only by never materialising the fp16 matrix — it
-saves the memory, which is the reason INT4 exists. `ops.matmul` dispatches on
-batch size for the decode win and does not pretend the prefill kernel is
-something it is not.
+The natural reading of that ratio is that `load_matrix_sync` recomputes fragment
+addressing on every call, so the fix is to drop to raw `mma.sync` + `ldmatrix`,
+hoist all fragment addresses out of the k-loop, and let the accumulator layout
+write straight to global memory (d0/d1 land in adjacent columns, so each pair is
+one `half2` store — no shared-memory staging epilogue at all).
+
+That kernel is in `csrc/gemm_w4a16.cu` as v7 and it is **bit-identical** to the
+wmma version, which is a satisfying confirmation that the hand-derived fragment
+layouts in `csrc/mma.cuh` are right.
+
+It is also **not faster**. 1.26 ms against wmma's 1.23 ms, with *more*
+instructions (332.6M vs 319.5M), presumably because hoisting addresses into
+registers costs moves the compiler was avoiding. The hypothesis was wrong: nvcc
+already lowers wmma to essentially the same ldmatrix/mma sequence, and wmma was
+never the overhead.
+
+Both kernels are kept, and v6 is the default because it is marginally the
+faster of the two. The value of v7 is that it makes the cost of the wmma
+abstraction a *measured* number — roughly zero — rather than an assumption.
+
+### 3. A runtime integer division — confirmed
+
+With wmma exonerated, the question became where the instructions actually go.
+Rather than guess a third time, the right move was a pipe breakdown:
+
+```
+smsp__inst_executed_pipe_fma.sum         131,432,448   (39.5%)
+smsp__inst_executed_pipe_alu.sum          82,960,384   (25.0%)
+smsp__inst_executed_pipe_lsu.sum          25,722,880    (7.7%)
+smsp__inst_executed_pipe_xu.sum            6,291,456    (1.9%)
+sm__inst_executed_pipe_tensor.sum         33,554,432   (10.1%)
+```
+
+On NVIDIA GPUs integer multiply-add issues on the **FMA pipe**, so 64% of this
+kernel on FMA+ALU means address arithmetic, not math. And the XU pipe —
+transcendentals and, crucially, integer division — had no business being
+occupied at all.
+
+The culprit was one line in the weight-staging loop:
+
+```cpp
+const half sc = S[((k0 + r8 * 8) / group_size) * N + n];
+```
+
+`group_size` was a kernel *argument*. Integer division by a runtime value
+compiles to a multi-instruction sequence, executed once per thread per
+iteration, for every weight tile in the kernel. Making it a template parameter
+turns it into a shift — the decode kernel had templated it all along; the
+prefill kernel had not.
+
+**The XU pipe went to exactly zero**, total instructions fell 333M → 287M, and
+throughput went 100.1 → 111.7 TFLOP/s.
+
+### 4. 32-bit indexing — instructions down, clock unchanged
+
+The address arithmetic was still widening to `size_t` before multiplying, making
+every offset a 64-bit IMAD. Doing the arithmetic in 32 bits and widening only
+the final offset (guarded by a host-side shape check) cut ALU another 36%:
+
+```
+smsp__inst_executed.sum        263,299,072   (was 332,595,200 — down 21%)
+smsp__inst_executed_pipe_alu.sum 43,073,536   (was  82,960,384 — down 48%)
+smsp__inst_executed_pipe_xu.sum           0
+```
+
+**Throughput did not move.** 111.7 TFLOP/s before and after.
+
+That is the useful result: having removed 21% of the instruction stream for no
+gain, the kernel is demonstrably **no longer issue-bound**. At 24% occupancy
+with a two-stage pipeline it is latency-bound — not enough independent work in
+flight to hide `mma` and shared-load latency. The next lever is a deeper (3–4
+stage) `cp.async` pipeline and cutting the 124-register footprint, not more
+instruction golf.
+
+Final state of the shipped kernel (v6), for comparison with the 319.5M it
+started at:
+
+```
+smsp__inst_executed.sum                  246,505,472   (down 23%)
+smsp__inst_executed_pipe_xu.sum                    0
+launch__registers_per_thread                     124
+sm__warps_active                               23.9 %
+```
+
+### Honest framing of the prefill numbers
+
+The fused kernel reaches 44% of cuBLAS fp16. Dequantising to fp16 and calling
+cuBLAS reaches 99–101%. At prefill, dequant-then-cuBLAS is the better
+engineering choice on time alone, and the fused kernel earns its place only by
+never materialising the fp16 matrix — it saves the memory, which is the reason
+INT4 exists. `ops.matmul` dispatches on batch size for the decode win and does
+not pretend the prefill kernel is something it is not.
+
+**The Triton baseline ties or wins here.** 111.7 TFLOP/s against this kernel's
+111.5 at 4096x4096, and 114.5 against 105.9 at 4096x14336. That is the expected
+shape of the result rather than an embarrassment: prefill is a well-trodden
+tiled-GEMM problem where an autotuner sweeping block sizes, warps and stages is
+hard to beat by hand in a few iterations. Decode is the opposite — an awkward,
+launch-geometry-sensitive, bandwidth-bound shape where `tl.dot`'s 16-row minimum
+tile wastes 15/16 of the work at M=1 — and there the CUDA kernel wins by 4.4x.
+Which regime rewards hand-written CUDA, and which does not, is the more useful
+finding than either number alone.
 
 ---
 
 ## What would come next
 
-1. **Raw `mma.sync` + `ldmatrix` for the prefill kernel.** The 9.5:1 instruction
-   ratio is the target; precomputed fragment addressing and an XOR-swizzled
-   shared layout would remove most of the non-tensor instructions wmma forces.
+1. **Deeper prefill pipeline.** The kernel is latency-bound at 24% occupancy
+   with two `cp.async` stages. Three or four stages, plus cutting the
+   128-register footprint to fit a third block per SM, is the remaining lever —
+   instruction count is not.
 2. **Fuse the split-K reduction.** A cooperative-groups grid sync or a
    deterministic atomic reduction would remove one of the two launches, worth
    ~3 us — around 20% on the smallest decode shapes.
 3. **`TN` as a tunable.** It is the one decode knob shown to change available
    parallelism that is still hard-coded at 4.
-4. **Shared-memory swizzling instead of padding.** `LDB = BK + 8` leaves a
-   4-way conflict on the B fragment path; an XOR swizzle removes it without the
-   padding overhead.
+4. **Shared-memory swizzling instead of padding.** `LDB = BK + 8` happens to be
+   conflict-free for `ldmatrix` (see `csrc/mma.cuh`) but costs 20% of the tile's
+   shared footprint; an XOR swizzle would reclaim it.
 5. **Sub-group split-K.** Splits are capped at `K / group_size`; splitting
    inside a group would lift the cap that limits the narrow shapes.

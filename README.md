@@ -132,27 +132,52 @@ python -m pytest tests/ -q     # 173 passed
 
 | | decode (M ≤ 8) | prefill (M > 8) |
 |---|---|---|
-| bottleneck | HBM bandwidth | tensor-core issue rate |
-| kernel | split-K streaming GEMV | 128×128 wmma tile, `cp.async` double-buffered |
+| bottleneck | HBM bandwidth | tensor-core latency |
+| kernel | split-K streaming GEMV | 128×128 tile, `cp.async` double-buffered |
 | metric | GB/s vs measured peak | TFLOP/s |
-| result | **3.11x over cuBLAS fp16** | 39% of cuBLAS fp16 |
+| result | **3.11x over cuBLAS fp16** | 43% of cuBLAS fp16 |
 
 **The prefill kernel is the weak half, and the repo says so.** At large M,
-dequantising to fp16 and calling cuBLAS reaches 99% of fp16 throughput; the
-fused kernel reaches 39%. It earns its place only by never materialising the
+dequantising to fp16 and calling cuBLAS reaches 97–99% of fp16 throughput; the
+fused kernel reaches 43%. It earns its place only by never materialising the
 fp16 weight matrix — it saves the memory, which is why INT4 exists — and
 `ops.matmul` dispatches on batch size rather than pretending otherwise.
 
-That gap was diagnosed rather than guessed at. Tile arithmetic intensity is
-`2·BM·BN·BK / (BM·BK·2 + BN·BK/2)`, and `BK` cancels — so the tile alone sets
-the ceiling. A 64×64 tile gives 51 FLOP/byte against the ~220 the A100 needs,
-capping it near 71 TFLOP/s; the first version measured 73.8, i.e. it was already
-at its roofline and no inner-loop tuning would have helped. Moving to 128×128
-lifted it to 100.1 TFLOP/s. `ncu` explains the rest: **9.5 non-tensor
-instructions issue per tensor instruction**, so the kernel is issue-bound on
-addressing overhead the wmma API will not let it remove. Closing that needs raw
-`mma.sync` + `ldmatrix`, which is the top item in
-[what comes next](docs/OPTIMIZATION_LOG.md#what-would-come-next).
+It got there by testing four hypotheses, of which **two were wrong**
+([full write-up](docs/OPTIMIZATION_LOG.md#prefill-regime-large-m-arithmetic-intensity-decides)):
+
+| hypothesis | outcome | TFLOP/s |
+|---|---|---|
+| the tile is too small — arithmetic intensity caps it | confirmed | 73.8 → 100.1 |
+| wmma's fragment addressing is the overhead | **disproved** | 100.1 |
+| a runtime integer division sits on the hot path | confirmed | 100.1 → 111.7 |
+| 64-bit address arithmetic still costs | 21% fewer instructions, **no speedup** | 111.7 |
+
+The tile result was predicted before writing code: intensity is
+`2·BM·BN·BK / (BM·BK·2 + BN·BK/2)` and `BK` cancels, so a 64×64 tile's
+51 FLOP/byte against the ~220 the A100 needs caps it near 71 TFLOP/s — and the
+first version measured 73.8, i.e. it was already at its roofline.
+
+The disproved ones are the more useful half. Rewriting the inner loop in raw
+`mma.sync` + `ldmatrix` produced a **bit-identical** kernel that was not faster,
+because nvcc already lowers wmma to much the same sequence — so the wmma
+abstraction costs roughly nothing, which is now a measured number rather than an
+assumption. And after an `ncu` pipe breakdown found 64% of instructions on the
+ALU/FMA pipes (where integer address arithmetic lives) and a stray occupied XU
+pipe — an integer division by a runtime `group_size` — fixing it took the XU
+pipe to exactly zero and bought 11%. Stripping a further 21% of instructions
+after that bought nothing at all, which is how we know the kernel is no longer
+issue-bound but latency-bound at 24% occupancy. That, not more instruction golf,
+is the next lever.
+
+**Triton wins the tiebreak here.** At prefill the Triton baseline reaches
+111.7 TFLOP/s against this kernel's 111.5 — a dead heat, and at 4096×14336 it is
+ahead (114.5 vs 105.9). That is the expected shape of the result: prefill is a
+well-trodden tiled-GEMM problem where an autotuner sweeping block sizes is hard
+to beat by hand, whereas decode is an awkward, launch-geometry-sensitive,
+bandwidth-bound shape where `tl.dot`'s 16-row minimum tile wastes 15/16 of the
+work at M=1 — which is why the CUDA kernel wins that regime by 4.4x. Knowing
+which regime rewards hand-written CUDA is most of the point of the exercise.
 
 ---
 
@@ -197,12 +222,13 @@ Apple M4 Pro that way.
 
 ```
 csrc/dequant.cuh        the lop3 bit-trick decode, with the derivation
+csrc/mma.cuh            mma.sync / ldmatrix wrappers + the fragment layouts
 csrc/gemv_w4a16.cu      decode kernels v0-v4
-csrc/gemm_w4a16.cu      prefill tensor-core kernel
+csrc/gemm_w4a16.cu      prefill kernels v6 (wmma) and v7 (mma.sync)
 python/nibblegemm/      quantiser (defines the on-device format), ops, Triton baseline
 bench/                  harness + benchmarks
 tests/                  173 tests
-docs/OPTIMIZATION_LOG.md   every measurement, including the two that disproved me
+docs/OPTIMIZATION_LOG.md   every measurement, including the ones that disproved me
 ```
 
 ## Scope

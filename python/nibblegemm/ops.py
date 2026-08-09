@@ -74,9 +74,16 @@ def gemv(X: torch.Tensor, qw: QuantizedWeight, version: int = 4, splits: int = 0
     )
 
 
-def gemm(X: torch.Tensor, qw: QuantizedWeight) -> torch.Tensor:
-    """Prefill-regime tensor-core matmul."""
-    return extension().gemm_w4a16(X, qw.qweight, qw.scales, qw.group_size)
+def gemm(X: torch.Tensor, qw: QuantizedWeight, version: int = 6) -> torch.Tensor:
+    """Prefill-regime tensor-core matmul.
+
+    ``version`` selects the inner-product implementation: 6 is the wmma
+    version, 7 is raw ``mma.sync`` + ``ldmatrix``. Both use the same 128x128
+    tile and produce bit-identical results, so the gap between them is purely
+    the cost of the wmma abstraction -- which measurement puts at roughly zero.
+    6 is the default because it is marginally the faster of the two.
+    """
+    return extension().gemm_w4a16(X, qw.qweight, qw.scales, qw.group_size, version)
 
 
 def matmul(X: torch.Tensor, qw: QuantizedWeight, splits: int = 0,

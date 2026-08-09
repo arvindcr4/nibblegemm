@@ -59,9 +59,10 @@ def prefill(K, N, group_size, use_triton):
 
         # Correctness at every measured point; a fast wrong kernel is worthless.
         ref = ng.reference_matmul(X, variants[0])
-        y = ng.gemm(X, variants[0])
-        err = (y.float() - ref.float()).abs().max().item() / ref.float().abs().mean().item()
-        assert err < 5e-2, f"gemm wrong at M={M} (rel err {err:.2e})"
+        for v in (6, 7):
+            y = ng.gemm(X, variants[0], version=v)
+            err = (y.float() - ref.float()).abs().max().item() / ref.float().abs().mean().item()
+            assert err < 5e-2, f"gemm v{v} wrong at M={M} (rel err {err:.2e})"
 
         def add(name, ms):
             tf = H.tflops(M, K, N, ms)
@@ -71,8 +72,10 @@ def prefill(K, N, group_size, use_triton):
 
         base = H.bench(lambda i: torch.mm(X, wrot[i]), reps=8, trials=20).median_ms
         add("torch fp16 (cuBLAS)", base)
-        add("nibblegemm gemm (wmma)",
-            H.bench(lambda i: ng.gemm(X, variants[i]), reps=8, trials=20).median_ms)
+        add("nibblegemm v6 (wmma)",
+            H.bench(lambda i: ng.gemm(X, variants[i], version=6), reps=8, trials=20).median_ms)
+        add("nibblegemm v7 (mma.sync)",
+            H.bench(lambda i: ng.gemm(X, variants[i], version=7), reps=8, trials=20).median_ms)
         add("dequant + cuBLAS",
             H.bench(lambda i: torch.mm(X, ng.dequant(variants[i])), reps=4, trials=12).median_ms)
         if use_triton:

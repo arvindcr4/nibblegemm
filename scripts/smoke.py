@@ -60,14 +60,21 @@ def main() -> int:
                 return 1
 
     section("gemm (tensor core) vs fp32 reference")
-    for M in (64, 128, 512, 1000):
+    for M in (17, 64, 128, 512, 1000):
         X = torch.randn(M, K, dtype=torch.float16, device="cuda")
         ref = ng.reference_matmul(X, qw)
-        y = ng.gemm(X, qw)
-        err = (y.float() - ref.float()).abs().max().item() / ref.float().abs().mean().item()
-        flag = "ok" if err < 5e-2 else "FAIL"
-        print(f"  M={M}: rel max err {err:.2e}  {flag}")
-        if err >= 5e-2:
+        scale = ref.float().abs().mean().item()
+        errs = {}
+        for v in (6, 7):
+            y = ng.gemm(X, qw, version=v)
+            errs[v] = (y.float() - ref.float()).abs().max().item() / scale
+        # Both kernels use the same tile and the same fp32 accumulation, so they
+        # should differ only in issue order, not in result.
+        cross = (ng.gemm(X, qw, version=6).float() - ng.gemm(X, qw, version=7).float())
+        cross_err = cross.abs().max().item() / scale
+        flag = "ok" if max(errs.values()) < 5e-2 and cross_err < 5e-2 else "FAIL"
+        print(f"  M={M}: v6 {errs[6]:.2e}  v7 {errs[7]:.2e}  v6-vs-v7 {cross_err:.2e}  {flag}")
+        if flag == "FAIL":
             return 1
 
     print("\nall smoke checks passed")

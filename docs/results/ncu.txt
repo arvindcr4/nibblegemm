@@ -2,39 +2,41 @@
 # NVIDIA A100-SXM4-40GB, CUDA 12.8
 # Regenerate with: bash tools/profile.sh
 
-## prefill kernel (gemm_v6_wmma), M=4096, K=N=4096, group_size=128
+## prefill v6, M=4096, K=N=4096, group_size=128
     Metric Name                                           Metric Unit Metric Value
-    dram__bytes.sum.per_second                                Gbyte/s        51.42
-    launch__registers_per_thread                      register/thread          128
+    dram__bytes.sum.per_second                                Gbyte/s        57.49
+    launch__registers_per_thread                      register/thread          124
     sm__inst_executed_pipe_tensor.sum                            inst   33,554,432
-    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        39.64
-    sm__warps_active.avg.pct_of_peak_sustained_active               %        24.31
-    smsp__inst_executed.sum                                      inst  319,463,424
+    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        37.32
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        23.89
+    smsp__inst_executed.sum                                      inst  246,505,472
+    smsp__inst_executed_pipe_alu.sum                             inst   59,957,248
+    smsp__inst_executed_pipe_fma.sum                             inst   73,252,864
+    smsp__inst_executed_pipe_lsu.sum                             inst   27,623,424
+    smsp__inst_executed_pipe_xu.sum                              inst            0
 
-# Reading: 128 registers/thread at 256 threads/block is exactly 2 blocks per SM
-# on a 65536-register SM, which is where the 24.3% occupancy comes from.
-# 319,463,424 / 33,554,432 = 9.52 instructions issued per tensor instruction --
-# the kernel is issue-bound on addressing and shared-memory bookkeeping, not on
-# math. Low DRAM throughput is expected here: at M=4096 the weights are reused
-# across rows, so this regime is compute-bound by construction.
-#
-# The tensor count checks out against the shape: (M/16)(N/16)(K/16) = 16,777,216
-# wmma 16x16x16 ops, each issuing 2 HMMA.16816 = 33,554,432.
-
-## decode kernel (gemv_v4_splitk), M=1, K=N=4096, group_size=128
+## prefill v7, M=4096, K=N=4096, group_size=128
     Metric Name                                           Metric Unit Metric Value
-    dram__bytes.sum.per_second                                Gbyte/s       713.85
+    dram__bytes.sum.per_second                                Gbyte/s        49.84
+    launch__registers_per_thread                      register/thread          124
+    sm__inst_executed_pipe_tensor.sum                            inst   33,554,432
+    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        36.61
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        23.80
+    smsp__inst_executed.sum                                      inst  263,299,072
+    smsp__inst_executed_pipe_alu.sum                             inst   43,073,536
+    smsp__inst_executed_pipe_fma.sum                             inst  108,331,008
+    smsp__inst_executed_pipe_lsu.sum                             inst   25,722,880
+    smsp__inst_executed_pipe_xu.sum                              inst            0
+
+## decode v4, M=1, K=N=4096, group_size=128
+    Metric Name                                           Metric Unit Metric Value
+    dram__bytes.sum.per_second                                Gbyte/s       721.44
     launch__registers_per_thread                      register/thread           60
     sm__inst_executed_pipe_tensor.sum                            inst      162,816
-    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        19.63
+    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        20.02
     sm__warps_active.avg.pct_of_peak_sustained_active               %        14.52
     smsp__inst_executed.sum                                      inst    1,097,728
-
-# Reading: 14.5% occupancy is not a defect for a streaming kernel -- it needs
-# loads in flight, not resident warps -- and the split ceiling of K/group_size
-# caps how many warps this shape can even supply. The 714 GB/s here is higher
-# than the 595 GB/s (eager) / 669 GB/s (CUDA graph) the timed benchmark reports
-# for this shape, because ncu counts DRAM traffic inside the kernel only, while
-# the benchmark divides compulsory bytes by end-to-end wall-clock and so absorbs
-# launch overhead and the split-K reduction pass. Use bench/ for throughput and
-# ncu for the ratios above.
+    smsp__inst_executed_pipe_alu.sum                             inst      364,544
+    smsp__inst_executed_pipe_fma.sum                             inst       87,040
+    smsp__inst_executed_pipe_lsu.sum                             inst       44,032
+    smsp__inst_executed_pipe_xu.sum                              inst            0

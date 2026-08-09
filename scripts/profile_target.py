@@ -19,6 +19,7 @@ def main() -> None:
     ap.add_argument("-K", type=int, default=4096)
     ap.add_argument("-N", type=int, default=4096)
     ap.add_argument("--group-size", type=int, default=128)
+    ap.add_argument("--gemm-version", type=int, default=6)
     ap.add_argument("--iters", type=int, default=3)
     args = ap.parse_args()
 
@@ -26,7 +27,7 @@ def main() -> None:
     qw = ng.quantize(W, group_size=args.group_size).to("cuda")
     X = torch.randn(args.M, args.K, dtype=torch.float16, device="cuda")
 
-    fn = (lambda: ng.gemv(X, qw, version=4)) if args.target == "gemv" else (lambda: ng.gemm(X, qw))
+    fn = (lambda: ng.gemv(X, qw, version=4)) if args.target == "gemv" else (lambda: ng.gemm(X, qw, version=args.gemm_version))
     fn()  # trigger the JIT build outside the profiled region
     torch.cuda.synchronize()
 

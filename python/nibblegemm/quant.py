@@ -12,11 +12,15 @@ is the reduction dimension.
 
 * **Grouping.** Quantisation groups run along ``K`` with size ``G`` (default
   128). Group ``g`` of column ``n`` gets one fp16 scale.
-* **Numeric scheme.** Symmetric INT4: ``scale = max|w| / 7`` and
-  ``q = clamp(round(w / scale), -8, 7)``. Stored biased into ``[0, 15]`` as
-  ``q + 8``; dequantisation is ``(q_u - 8) * scale``. There is no per-group
-  zero-point, which matches how GPTQ/AWQ symmetric checkpoints are shipped and
-  lets the kernel fold the ``-8`` into a constant.
+* **Numeric scheme.** Symmetric INT4: ``q = clamp(round(w / scale), -8, 7)``,
+  stored biased into ``[0, 15]`` as ``q + 8``, with dequantisation
+  ``(q_u - 8) * scale``. There is no per-group zero-point, which matches how
+  symmetric GPTQ/AWQ checkpoints are shipped and lets the kernel fold the
+  ``-8`` into a constant.
+* **Scale selection.** Plain max-abs: ``scale = max|w| / 7``. An MSE-minimising
+  clipping search is implemented in :func:`_search_scale` and is **off by
+  default**, because measuring it end-to-end showed it lowers weight error and
+  raises model perplexity -- see that function.
 * **Packing.** Eight INT4 values along ``K`` share one ``uint32``, giving
   ``qweight[K // 8, N]``. Consecutive ``n`` stay adjacent in memory, so a warp
   walking ``n`` issues perfectly coalesced 32-bit (or vectorised 128-bit) loads.
@@ -49,6 +53,9 @@ QMIN, QMAX = -8, 7
 ZERO_POINT = 8
 PACK_FACTOR = 8
 
+#: Clipping ratios tried by the scale search, from "use the full range" downward.
+CLIP_RATIOS = torch.linspace(1.0, 0.55, 19)
+
 
 @dataclass(frozen=True)
 class QuantizedWeight:
@@ -71,8 +78,60 @@ class QuantizedWeight:
         return self.qweight.numel() * 4 + self.scales.numel() * 2
 
 
-def quantize(W: torch.Tensor, group_size: int = 128) -> QuantizedWeight:
-    """Quantise a ``[K, N]`` weight matrix to packed group-wise INT4."""
+def _search_scale(groups: torch.Tensor, n_chunk: int = 4096) -> torch.Tensor:
+    """Pick a per-group scale by minimising quantisation MSE instead of max-abs.
+
+    The reasoning seemed sound: max-abs hands the whole 4-bit range to whatever
+    the largest weight in a group happens to be, so one outlier stretches the
+    step size for the other 127. Clipping it should trade a large error on one
+    weight for a small saving on many.
+
+    It does exactly that, and it is **worse**. On TinyLlama-1.1B this search cuts
+    weight RMSE by 12% and increases perplexity by 23% relative to fp16, against
+    12% for plain max-abs. Kept as an option, off by default, because the
+    negative result is worth preserving.
+
+    The lesson is that weight MSE is the wrong objective. The outliers a
+    squared-error criterion is happiest to clip are precisely the
+    large-magnitude weights transformer outputs depend on most, so averaging
+    error down across a group can concentrate it exactly where it does damage.
+    This is why AWQ weights the error by *activation* magnitude and GPTQ uses
+    second-order (Hessian) information rather than optimising weights in
+    isolation -- both are measuring the thing that actually matters, which is
+    the error at the layer's output, not at its weights.
+
+    Chunked over columns so a 14336x4096 layer does not allocate the whole
+    search at once, and run on the weight's own device.
+    """
+    n_groups, gs, N = groups.shape
+    out = torch.empty(n_groups, N, dtype=groups.dtype, device=groups.device)
+    ratios = CLIP_RATIOS.to(groups.device, groups.dtype)
+
+    for start in range(0, N, n_chunk):
+        block = groups[:, :, start:start + n_chunk]
+        maxabs = block.abs().amax(dim=1)
+        best_err = torch.full_like(maxabs, float("inf"))
+        best = (maxabs / QMAX).clamp(min=1e-8)
+
+        for ratio in ratios:
+            scale = (maxabs * ratio / QMAX).clamp(min=1e-8)
+            q = torch.round(block / scale.unsqueeze(1)).clamp_(QMIN, QMAX)
+            err = (q.mul_(scale.unsqueeze(1)).sub_(block)).pow_(2).sum(dim=1)
+            better = err < best_err
+            best_err = torch.where(better, err, best_err)
+            best = torch.where(better, scale, best)
+        out[:, start:start + n_chunk] = best
+    return out
+
+
+def quantize(W: torch.Tensor, group_size: int = 128, clip_search: bool = False) -> QuantizedWeight:
+    """Quantise a ``[K, N]`` weight matrix to packed group-wise INT4.
+
+    ``clip_search`` selects each group's scale by minimising squared error over
+    a range of clipping ratios rather than taking max-abs. It is **off by
+    default**: it reduces weight error but measurably degrades model quality,
+    for the reason documented in :func:`_search_scale`.
+    """
     if W.ndim != 2:
         raise ValueError(f"expected a 2-D weight, got shape {tuple(W.shape)}")
     K, N = W.shape
@@ -81,17 +140,21 @@ def quantize(W: torch.Tensor, group_size: int = 128) -> QuantizedWeight:
     if group_size % PACK_FACTOR:
         raise ValueError(f"group_size={group_size} must be divisible by {PACK_FACTOR}")
 
-    w = W.detach().float().cpu()
+    w = W.detach().float()
     groups = w.reshape(K // group_size, group_size, N)
 
-    # Symmetric scale. Clamp away exact zeros so all-zero groups stay finite.
-    scale = (groups.abs().amax(dim=1) / QMAX).clamp(min=1e-8)  # [K/G, N]
+    if clip_search:
+        scale = _search_scale(groups)
+    else:
+        # Clamp away exact zeros so all-zero groups stay finite.
+        scale = (groups.abs().amax(dim=1) / QMAX).clamp(min=1e-8)
+
     q = torch.round(groups / scale.unsqueeze(1)).clamp(QMIN, QMAX)
-    qu = (q + ZERO_POINT).reshape(K, N).to(torch.uint8).numpy()  # values in [0, 15]
+    qu = (q + ZERO_POINT).reshape(K, N).to(torch.uint8).cpu().numpy()  # values in [0, 15]
 
     return QuantizedWeight(
         qweight=torch.from_numpy(pack_nibbles(qu)),
-        scales=scale.to(torch.float16).contiguous(),
+        scales=scale.to(torch.float16).cpu().contiguous(),
         group_size=group_size,
         K=K,
         N=N,

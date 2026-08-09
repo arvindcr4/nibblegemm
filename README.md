@@ -44,6 +44,54 @@ the scripts in [`bench/`](bench/).
 
 ---
 
+## Does it matter in a real model?
+
+A fast kernel that does not move a decode step, or that ruins the model, is
+worthless. Both are measured ([`bench/bench_model.py`](bench/bench_model.py)).
+
+**Speed, at Llama-3-8B scale.** A decode step is ~224 projections, and the
+microbenchmark win only counts if per-layer overhead does not eat it:
+
+| | weights | decode step | tokens/s | under CUDA graph |
+|---|---|---|---|---|
+| fp16 (cuBLAS) | 13.0 GiB | 12.72 ms | 78.6 | 85.8 |
+| **nibblegemm INT4** | **3.35 GiB** | **5.14 ms** | **194.7** | **227.5** |
+
+**2.48x eager, 2.65x under CUDA graph, on 3.88x less weight memory.** The full
+stack lands slightly under the best single-shape number because a decode step is
+a *mix*: the narrow GQA k/v projections (4096×1024) and the 4096×4096 q/o
+projections are the shapes that sit furthest from peak.
+
+**Quality**, on a real checkpoint (TinyLlama-1.1B, perplexity over 4096 tokens
+of held-out prose):
+
+| | weights | perplexity | vs fp16 |
+|---|---|---|---|
+| fp16 | 2.05 GiB | 11.355 | — |
+| INT4 (max-abs RTN) | 0.71 GiB | 12.760 | +12.4% |
+| INT4 + MSE clip search | 0.71 GiB | 13.947 | +22.8% |
+
+The kernel contributes **none** of that error — it is bit-exact against the
+reference. All 12.4% is the quantisation *scheme*: round-to-nearest with no
+calibration, which is the weakest algorithm in the family. GPTQ or AWQ weights
+would slot into the same kernel unchanged and recover most of it.
+
+That third row is a negative result worth keeping. Searching clipping ratios to
+minimise weight MSE **cut weight RMSE by 12% and made the model 23% worse**,
+because a squared-error criterion is happiest to clip exactly the
+large-magnitude weights transformer outputs depend on. It is a clean
+demonstration of why AWQ weights error by *activation* magnitude and GPTQ uses
+second-order information: weight error is a proxy, and optimising the proxy
+moved the real metric the wrong way. The search is still in the code, off by
+default.
+
+One caveat stated plainly: the 1.1B decode-throughput numbers in that run are
+overhead-dominated — at 22 layers in eager HuggingFace, Python dispatch swamps
+the kernel and the fp16/INT4 difference is inside the noise. The 8B table above
+is the meaningful speed measurement; the 1.1B run is there for quality.
+
+---
+
 ## The optimisation ladder
 
 Five kernels, each changing exactly one thing, so every speedup is attributable.
@@ -216,6 +264,8 @@ python bench/bench_decode.py         # the ladder and its baselines
 python bench/bench_prefill.py        # tensor-core path + crossover sweep
 python bench/autotune.py             # split-K / block-width sweep
 python bench/launch_overhead.py      # eager vs CUDA graph
+python bench/bench_model.py layers   # decode step at Llama-3-8B scale
+python bench/bench_model.py model    # perplexity on a real checkpoint
 ```
 
 No local GPU? [`tools/colab_run.py`](tools/colab_run.py) ships the working tree
@@ -232,7 +282,7 @@ csrc/mma.cuh            mma.sync / ldmatrix wrappers + the fragment layouts
 csrc/gemv_w4a16.cu      decode kernels v0-v4
 csrc/gemm_w4a16.cu      prefill kernels v6 (wmma) and v7 (mma.sync)
 python/nibblegemm/      quantiser (defines the on-device format), ops, Triton baseline
-bench/                  harness + benchmarks
+bench/                  harness, kernel benchmarks, end-to-end model benchmark
 tests/                  173 tests
 docs/OPTIMIZATION_LOG.md   every measurement, including the ones that disproved me
 ```

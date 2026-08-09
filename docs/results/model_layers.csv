@@ -1,0 +1,3 @@
+impl,weights GiB,step ms,graph ms,tok/s,graph tok/s,GB/s
+fp16 (cuBLAS),13.0,12.72,11.657,78.6,85.8,1197.4
+nibblegemm INT4,3.35,5.137,4.395,194.7,227.5,818.8

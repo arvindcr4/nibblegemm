@@ -361,6 +361,83 @@ work at M=1.
 
 ---
 
+## End to end: a decode step, and a real model
+
+Microbenchmarks answer whether a kernel is fast. They do not answer whether it
+makes anything faster, or whether the model still works. Both are measured in
+`bench/bench_model.py`.
+
+### Speed at Llama-3-8B scale
+
+A decode step is 32 layers x 7 projections = 224 kernel launches, so a 31 us
+projection only matters if per-layer overhead does not swallow it. The stack
+below uses exact Llama-3-8B geometry (hidden 4096, GQA kv 1024, intermediate
+14336). Weights are random, which is fine: throughput is a property of the
+traffic, not the values, and it avoids a 16 GB download to measure bandwidth.
+
+| | weights | decode step | tokens/s | CUDA graph | graph tokens/s |
+|---|---|---|---|---|---|
+| fp16 (cuBLAS) | 13.0 GiB | 12.72 ms | 78.6 | 11.66 ms | 85.8 |
+| nibblegemm INT4 | 3.35 GiB | 5.14 ms | 194.7 | 4.40 ms | 227.5 |
+
+**2.48x eager, 2.65x under CUDA graph, on 3.88x less weight memory.**
+
+The stack figure sits below the best single-shape result (3.13x) because a
+decode step is a mix of shapes, and the mix is unfavourable: the GQA k/v
+projections are narrow (4096x1024) and the q/o projections are 4096x4096, which
+is the shape already identified above as launch-latency-bound. The MLP
+projections, which dominate the parameter count, run at the full 3.1x.
+
+One measurement note: a single layer's weights are replayed 32 times rather than
+materialising 32 copies (which would cost 14 GB in fp16). That is only sound
+because one layer is 436 MB in fp16 and 109 MB in INT4, both far larger than the
+40 MB L2 -- so the loop still streams from HBM, exactly as the rotating buffers
+in `harness.py` ensure elsewhere.
+
+### Quality on a real checkpoint
+
+TinyLlama-1.1B, all 154 decoder projections quantised (lm_head left in fp16, as
+is standard), perplexity over 4096 tokens of held-out prose:
+
+| | weights | perplexity | vs fp16 |
+|---|---|---|---|
+| fp16 | 2.05 GiB | 11.355 | — |
+| INT4, max-abs RTN | 0.71 GiB | 12.760 | +12.4% |
+| INT4, MSE clip search | 0.71 GiB | 13.947 | +22.8% |
+
+**None of that error is the kernel.** The decode path is bit-exact against the
+reference and the GEMM matches an fp32 reference to 4e-3 relative. The 12.4% is
+entirely the quantisation *scheme*: round-to-nearest, no calibration data, no
+error compensation — the weakest member of the family. GPTQ or AWQ weights would
+load into this kernel unchanged, since the format is the same, and would recover
+most of the gap.
+
+### A sixth disproved hypothesis: weight MSE is the wrong objective
+
+Max-abs scaling gives the whole 4-bit range to whatever the largest weight in a
+group happens to be, stretching the step size for the other 127. Searching
+clipping ratios for the minimum squared error should therefore trade one large
+error for many small savings.
+
+It does precisely that, and it is worse. Weight RMSE fell 12% (0.00396 ->
+0.00349 on a synthetic matrix with realistic outliers) while perplexity rose
+from +12.4% to **+22.8%**.
+
+The proxy moved the right way and the real metric moved the wrong way, which is
+the whole lesson. A squared-error criterion is happiest to clip the
+large-magnitude weights, and those are exactly the ones transformer outputs
+depend on. This is why AWQ scales by *activation* magnitude and GPTQ uses
+second-order information: both measure error at the layer's output rather than
+at its weights. The search stays in `quant.py`, off by default, because a
+documented negative result is more useful than a deleted one.
+
+A caveat on that run's throughput column: at 1.1B in eager HuggingFace, Python
+dispatch dominates and the fp16/INT4 decode rates are within noise of each
+other. That is not a kernel result, it is a framework one — and it is the reason
+the speed measurement above is done at 8B scale with CUDA graphs.
+
+---
+
 ## What would come next
 
 1. **Deeper `cp.async` staging for activations.** The weight path is now

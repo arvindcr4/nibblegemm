@@ -10,8 +10,8 @@ stack (vLLM, SGLang, TensorRT-LLM) ships a hand-written W4A16 kernel rather than
 calling cuBLAS.
 
 **On an A100-SXM4-40GB, `nibblegemm` runs a Llama-3-8B MLP projection at batch 1
-in 31 µs: 3.11x faster than cuBLAS fp16, 4.4x faster than a hand-written Triton
-W4A16 kernel, and 80% of the theoretical ceiling that the 4-bit byte reduction
+in 31 µs: 3.13x faster than cuBLAS fp16, 4.5x faster than a hand-written Triton
+W4A16 kernel, and 81% of the theoretical ceiling that the 4-bit byte reduction
 allows.**
 
 ---
@@ -24,10 +24,10 @@ the spec sheet's 1555 GB/s is not reachable by anything).
 
 | shape (K×N) | layer | cuBLAS fp16 | Triton W4A16 | **nibblegemm** | speedup | GB/s | % of ceiling |
 |---|---|---|---|---|---|---|---|
-| 4096×14336 | 8B gate/up | 0.097 ms | 0.137 ms | **0.031 ms** | **3.11x** | 970 | 80% |
-| 14336×4096 | 8B down | 0.096 ms | 0.201 ms | **0.032 ms** | **2.96x** | 936 | 76% |
-| 8192×8192 | 70B attn | 0.105 ms | 0.166 ms | **0.036 ms** | **2.93x** | 966 | 76% |
-| 4096×4096 | 8B q/o | 0.031 ms | 0.076 ms | **0.015 ms** | **2.12x** | 595 | 55% |
+| 4096×14336 | 8B gate/up | 0.097 ms | 0.138 ms | **0.031 ms** | **3.13x** | 977 | 81% |
+| 14336×4096 | 8B down | 0.096 ms | 0.200 ms | **0.032 ms** | **2.98x** | 941 | 77% |
+| 8192×8192 | 70B attn | 0.105 ms | 0.166 ms | **0.036 ms** | **2.93x** | 970 | 76% |
+| 4096×4096 | 8B q/o | 0.031 ms | 0.077 ms | **0.014 ms** | **2.14x** | 603 | 55% |
 
 **About "% of ceiling".** At group size 128, INT4 weights plus scales are 3.88x
 smaller than fp16. In a bandwidth-bound regime that is the *most* any INT4
@@ -51,13 +51,13 @@ Shape 4096×14336, M=1:
 
 | stage | change | ms | GB/s | vs previous |
 |---|---|---|---|---|
-| v0 | naive: thread per output, scalar decode | 0.534 | 57 | — |
-| v1 | reuse each packed word for all 8 nibbles | 0.297 | 102 | 1.80x |
-| v2 | `lop3` bit-trick decode + half2 FMA | 0.073 | 417 | 4.09x |
+| v0 | naive: thread per output, scalar decode | 0.537 | 56 | — |
+| v1 | reuse each packed word for all 8 nibbles | 0.299 | 102 | 1.80x |
+| v2 | `lop3` bit-trick decode + half2 FMA | 0.073 | 416 | 4.09x |
 | v3 | 128-bit loads, 4 columns per thread | 0.132 | 229 | **0.55x** |
-| v4 | split-K across the reduction axis | 0.031 | 970 | 4.23x |
+| v4 | split-K across the reduction axis | 0.031 | 977 | 4.28x |
 
-**17.1x end to end.** Two of these are worth reading about:
+**17.3x end to end.** Two of these are worth reading about:
 
 **v2 — dequantisation without a conversion instruction.** `0x6400` is exactly
 `1024.0` in fp16, and at that exponent the mantissa bits are integer-valued. So
@@ -132,18 +132,18 @@ python -m pytest tests/ -q     # 173 passed
 
 | | decode (M ≤ 8) | prefill (M > 8) |
 |---|---|---|
-| bottleneck | HBM bandwidth | tensor-core latency |
-| kernel | split-K streaming GEMV | 128×128 tile, `cp.async` double-buffered |
+| bottleneck | HBM bandwidth | memory latency, not issue rate |
+| kernel | split-K streaming GEMV | 128×128 tile, `cp.async` + register-pipelined weights |
 | metric | GB/s vs measured peak | TFLOP/s |
-| result | **3.11x over cuBLAS fp16** | 43% of cuBLAS fp16 |
+| result | **3.13x over cuBLAS fp16** | 59–64% of cuBLAS fp16 |
 
-**The prefill kernel is the weak half, and the repo says so.** At large M,
-dequantising to fp16 and calling cuBLAS reaches 97–99% of fp16 throughput; the
-fused kernel reaches 43%. It earns its place only by never materialising the
-fp16 weight matrix — it saves the memory, which is why INT4 exists — and
-`ops.matmul` dispatches on batch size rather than pretending otherwise.
+**Prefill is still the weaker half, and the repo says so.** Dequantising to fp16
+and calling cuBLAS reaches 99–100% of fp16 throughput; the fused kernel reaches
+59–64%. It earns its place by never materialising the fp16 weight matrix — it
+saves the memory, which is why INT4 exists — and `ops.matmul` dispatches on
+batch size rather than pretending otherwise.
 
-It got there by testing four hypotheses, of which **two were wrong**
+It got there by testing five hypotheses, of which **two were wrong**
 ([full write-up](docs/OPTIMIZATION_LOG.md#prefill-regime-large-m-arithmetic-intensity-decides)):
 
 | hypothesis | outcome | TFLOP/s |
@@ -152,32 +152,38 @@ It got there by testing four hypotheses, of which **two were wrong**
 | wmma's fragment addressing is the overhead | **disproved** | 100.1 |
 | a runtime integer division sits on the hot path | confirmed | 100.1 → 111.7 |
 | 64-bit address arithmetic still costs | 21% fewer instructions, **no speedup** | 111.7 |
+| the weight path is synchronous | confirmed | 111.7 → **150.0** |
 
 The tile result was predicted before writing code: intensity is
 `2·BM·BN·BK / (BM·BK·2 + BN·BK/2)` and `BK` cancels, so a 64×64 tile's
 51 FLOP/byte against the ~220 the A100 needs caps it near 71 TFLOP/s — and the
 first version measured 73.8, i.e. it was already at its roofline.
 
-The disproved ones are the more useful half. Rewriting the inner loop in raw
-`mma.sync` + `ldmatrix` produced a **bit-identical** kernel that was not faster,
-because nvcc already lowers wmma to much the same sequence — so the wmma
-abstraction costs roughly nothing, which is now a measured number rather than an
-assumption. And after an `ncu` pipe breakdown found 64% of instructions on the
-ALU/FMA pipes (where integer address arithmetic lives) and a stray occupied XU
-pipe — an integer division by a runtime `group_size` — fixing it took the XU
-pipe to exactly zero and bought 11%. Stripping a further 21% of instructions
-after that bought nothing at all, which is how we know the kernel is no longer
-issue-bound but latency-bound at 24% occupancy. That, not more instruction golf,
-is the next lever.
+The two failures are what located the real problem. Rewriting the inner loop in
+raw `mma.sync` + `ldmatrix` produced a **bit-identical** kernel that was not
+faster, because nvcc already lowers wmma to much the same sequence. Then an
+`ncu` pipe breakdown found 64% of instructions on the ALU/FMA pipes (where
+integer address arithmetic lives) plus a stray occupied XU pipe — an integer
+division by a runtime `group_size`, which templating took to exactly zero for
++11%. But stripping a further 21% of instructions after that bought *nothing*,
+which proved the kernel was not issue-bound at all. It was stalling.
 
-**Triton wins the tiebreak here.** At prefill the Triton baseline reaches
-111.7 TFLOP/s against this kernel's 111.5 — a dead heat, and at 4096×14336 it is
-ahead (114.5 vs 105.9). That is the expected shape of the result: prefill is a
-well-trodden tiled-GEMM problem where an autotuner sweeping block sizes is hard
-to beat by hand, whereas decode is an awkward, launch-geometry-sensitive,
+On what, specifically: activations stream through `cp.async`, but weights must
+be **decoded** before they can be stored, so the weight path was a plain global
+load followed by a stall, per thread, per tile. Splitting staging into a
+register prefetch and a commit placed a full tile apart gives every weight load
+~128 `mma` instructions of cover. Occupancy did not change and the instruction
+count barely did, but SM throughput went from 37% to 49% — the signature of
+covered latency rather than less work — and throughput rose 34%.
+
+**Against Triton, the kernel now leads in both regimes**: 1.34x at prefill
+(150.0 vs 111.6 TFLOP/s) and 4.5x at decode. Before that last change prefill was
+a dead heat, which was itself the useful signal — prefill is a well-trodden
+tiled-GEMM problem where an autotuner sweeping block sizes is hard to beat by
+hand, and it took a structural change to the pipeline rather than a tuning knob
+to get ahead. Decode is the opposite: an awkward, launch-geometry-sensitive,
 bandwidth-bound shape where `tl.dot`'s 16-row minimum tile wastes 15/16 of the
-work at M=1 — which is why the CUDA kernel wins that regime by 4.4x. Knowing
-which regime rewards hand-written CUDA is most of the point of the exercise.
+work at M=1.
 
 ---
 

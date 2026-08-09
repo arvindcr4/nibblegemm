@@ -29,6 +29,10 @@ REMOTE = "/content/nibblegemm"
 SKIP_DIRS = {
     ".git", "__pycache__", "build", "dist", ".pytest_cache",
     ".ipynb_checkpoints", ".venv", "venv", ".mypy_cache", "artifacts",
+    # Benchmark output, not input. Shipping it would overwrite results the VM
+    # just generated with whatever stale copy happens to be on this laptop --
+    # which silently makes a "fetch the results" round trip return the old ones.
+    "results",
 }
 SKIP_SUFFIX = (".so", ".o", ".pyc", ".tar.gz", ".ncu-rep", ".nsys-rep")
 

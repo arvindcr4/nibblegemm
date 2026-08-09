@@ -4,37 +4,37 @@
 
 ## prefill v6, M=4096, K=N=4096, group_size=128
     Metric Name                                           Metric Unit Metric Value
-    dram__bytes.sum.per_second                                Gbyte/s        57.49
-    launch__registers_per_thread                      register/thread          124
+    dram__bytes.sum.per_second                                Gbyte/s        68.49
+    launch__registers_per_thread                      register/thread          127
     sm__inst_executed_pipe_tensor.sum                            inst   33,554,432
-    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        37.32
-    sm__warps_active.avg.pct_of_peak_sustained_active               %        23.89
-    smsp__inst_executed.sum                                      inst  246,505,472
-    smsp__inst_executed_pipe_alu.sum                             inst   59,957,248
-    smsp__inst_executed_pipe_fma.sum                             inst   73,252,864
-    smsp__inst_executed_pipe_lsu.sum                             inst   27,623,424
+    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        48.85
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        24.00
+    smsp__inst_executed.sum                                      inst  226,689,024
+    smsp__inst_executed_pipe_alu.sum                             inst   61,980,672
+    smsp__inst_executed_pipe_fma.sum                             inst   69,206,016
+    smsp__inst_executed_pipe_lsu.sum                             inst   27,656,192
     smsp__inst_executed_pipe_xu.sum                              inst            0
 
 ## prefill v7, M=4096, K=N=4096, group_size=128
     Metric Name                                           Metric Unit Metric Value
-    dram__bytes.sum.per_second                                Gbyte/s        49.84
-    launch__registers_per_thread                      register/thread          124
+    dram__bytes.sum.per_second                                Gbyte/s        56.23
+    launch__registers_per_thread                      register/thread          127
     sm__inst_executed_pipe_tensor.sum                            inst   33,554,432
-    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        36.61
-    sm__warps_active.avg.pct_of_peak_sustained_active               %        23.80
-    smsp__inst_executed.sum                                      inst  263,299,072
-    smsp__inst_executed_pipe_alu.sum                             inst   43,073,536
-    smsp__inst_executed_pipe_fma.sum                             inst  108,331,008
-    smsp__inst_executed_pipe_lsu.sum                             inst   25,722,880
+    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        43.75
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        23.95
+    smsp__inst_executed.sum                                      inst  244,523,008
+    smsp__inst_executed_pipe_alu.sum                             inst   45,137,920
+    smsp__inst_executed_pipe_fma.sum                             inst  105,275,392
+    smsp__inst_executed_pipe_lsu.sum                             inst   25,755,648
     smsp__inst_executed_pipe_xu.sum                              inst            0
 
 ## decode v4, M=1, K=N=4096, group_size=128
     Metric Name                                           Metric Unit Metric Value
-    dram__bytes.sum.per_second                                Gbyte/s       721.44
+    dram__bytes.sum.per_second                                Gbyte/s       708.25
     launch__registers_per_thread                      register/thread           60
     sm__inst_executed_pipe_tensor.sum                            inst      162,816
-    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        20.02
-    sm__warps_active.avg.pct_of_peak_sustained_active               %        14.52
+    sm__throughput.avg.pct_of_peak_sustained_elapsed                %        19.73
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        14.51
     smsp__inst_executed.sum                                      inst    1,097,728
     smsp__inst_executed_pipe_alu.sum                             inst      364,544
     smsp__inst_executed_pipe_fma.sum                             inst       87,040

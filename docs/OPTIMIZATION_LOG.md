@@ -42,20 +42,20 @@ Bandwidth-bound. Headline metric is GB/s, not TFLOP/s. Shape 4096x14336
 
 | stage | what changed | ms | GB/s | vs previous |
 |---|---|---|---|---|
-| v0 naive | thread per output, scalar decode | 0.534 | 57 | — |
-| v1 coalesced | reuse each packed word for all 8 nibbles | 0.297 | 102 | 1.80x |
-| v2 fast decode | `lop3` bit-trick decode, half2 FMA, smem activations | 0.073 | 417 | 4.09x |
+| v0 naive | thread per output, scalar decode | 0.537 | 56 | — |
+| v1 coalesced | reuse each packed word for all 8 nibbles | 0.299 | 102 | 1.80x |
+| v2 fast decode | `lop3` bit-trick decode, half2 FMA, smem activations | 0.073 | 416 | 4.09x |
 | v3 vectorised | 128-bit loads, 4 output columns per thread | 0.132 | 229 | **0.55x** |
-| v4 split-K | split the reduction axis across blocks | 0.031 | 970 | 4.23x |
+| v4 split-K | split the reduction axis across blocks | 0.031 | 977 | 4.28x |
 
 For reference on the same shape: cuBLAS fp16 runs in 0.097 ms, a hand-written
-Triton W4A16 kernel in 0.137 ms, and dequantise-then-cuBLAS in 0.225 ms.
+Triton W4A16 kernel in 0.138 ms, and dequantise-then-cuBLAS in 0.225 ms.
 
-**Net 17.1x over the naive kernel, 3.11x over cuBLAS fp16, and 4.4x over the
-Triton baseline** — 80% of the 3.88x ceiling the byte ratio allows.
+**Net 17.3x over the naive kernel, 3.13x over cuBLAS fp16, and 4.5x over the
+Triton baseline** — 81% of the 3.88x ceiling the byte ratio allows.
 
 Across all four shapes at M=1, v4 lands at 2.1x–3.1x over cuBLAS fp16
-(55%–80% of ceiling); the weakest is 4096x4096, for reasons diagnosed below.
+(55%–81% of ceiling); the weakest is 4096x4096, for reasons diagnosed below.
 
 ### v1: the load, not the math
 
@@ -190,16 +190,19 @@ A 64x64 tile gives 51 FLOP/byte. The A100 needs roughly
 The first version measured **73.8 TFLOP/s** — its roofline, not a defect. No
 inner-loop tuning would have moved it.
 
-What follows is four hypotheses about the remaining gap, in the order they were
-tested. Two were right. Shape 4096x4096, M=4096.
+What follows is five hypotheses about the remaining gap, in the order they were
+tested. Three were right. Shape 4096x4096, M=4096.
 
 | # | hypothesis | outcome | TFLOP/s |
 |---|---|---|---|
 | — | starting point (64x64 tile) | — | 73.8 |
 | 1 | the tile is too small — intensity caps it | **confirmed** | 100.1 |
 | 2 | wmma's addressing overhead is the limit | **disproved** | 100.1 |
-| 3 | a runtime integer division is on the hot path | **confirmed** | 111.7 |
-| 4 | 64-bit address arithmetic still costs | instructions down 9%, **no speedup** | 111.7 |
+| 3 | a runtime integer division sits on the hot path | **confirmed** | 111.7 |
+| 4 | 64-bit address arithmetic still costs | instructions down 21%, **no speedup** | 111.7 |
+| 5 | the weight path is synchronous | **confirmed** | **150.0** |
+
+**2.03x end to end**, and the two failures were what pointed at the fifth.
 
 ### 1. Tile size — confirmed
 
@@ -293,54 +296,85 @@ smsp__inst_executed_pipe_xu.sum           0
 That is the useful result: having removed 21% of the instruction stream for no
 gain, the kernel is demonstrably **no longer issue-bound**. At 24% occupancy
 with a two-stage pipeline it is latency-bound — not enough independent work in
-flight to hide `mma` and shared-load latency. The next lever is a deeper (3–4
-stage) `cp.async` pipeline and cutting the 124-register footprint, not more
-instruction golf.
+flight to hide memory latency. Which raises the obvious question: *which*
+latency?
 
-Final state of the shipped kernel (v6), for comparison with the 319.5M it
+### 5. The weight path is synchronous — confirmed, and the biggest win
+
+Activations stream in through `cp.async`: the thread fires the copy and keeps
+issuing math while it lands. Weights cannot do that, because they have to be
+**decoded** before they can be stored — so the weight path was a plain
+global load, a stall, a dequantisation, and a shared store, all in program
+order. Every thread paid a full memory latency per tile, and no amount of
+instruction reduction touches a stall.
+
+The fix is to software-pipeline it through registers: split staging into a
+*prefetch* (global to register) and a *commit* (register to dequantise to
+shared), and place them a whole tile apart. At tile `t` the kernel commits the
+weights it fetched during tile `t-1` and issues the fetch for tile `t+1`, so
+every weight load has ~128 `mma` instructions of cover.
+
+One detail keeps the commit path branch-free: out-of-range columns prefetch a
+zero scale, and `(q - 8) * 0` is zero, so masking falls out of the arithmetic
+instead of costing a test per element.
+
+| | before | after |
+|---|---|---|
+| TFLOP/s (4096x4096, M=4096) | 111.7 | **150.0** |
+| `sm__throughput` | 37.3% | **48.9%** |
+| achieved occupancy | 23.9% | 24.0% |
+| instructions | 246.5M | 226.7M |
+| registers/thread | 124 | 127 |
+
+The profile is the confirmation. Occupancy did not move and the instruction
+count barely did — but SM throughput went up by a third. That is precisely what
+exposed latency being covered looks like, as opposed to doing less work.
+
+Final state of the shipped kernel (v6), against the 319.5M and 73.8 TFLOP/s it
 started at:
 
 ```
-smsp__inst_executed.sum                  246,505,472   (down 23%)
+smsp__inst_executed.sum                  226,689,024   (down 29%)
 smsp__inst_executed_pipe_xu.sum                    0
-launch__registers_per_thread                     124
-sm__warps_active                               23.9 %
+sm__throughput                                48.9 %   (was 39.8%)
+launch__registers_per_thread                     127
+sm__warps_active                               24.0 %
 ```
 
 ### Honest framing of the prefill numbers
 
-The fused kernel reaches 44% of cuBLAS fp16. Dequantising to fp16 and calling
-cuBLAS reaches 99–101%. At prefill, dequant-then-cuBLAS is the better
-engineering choice on time alone, and the fused kernel earns its place only by
-never materialising the fp16 matrix — it saves the memory, which is the reason
-INT4 exists. `ops.matmul` dispatches on batch size for the decode win and does
-not pretend the prefill kernel is something it is not.
+The fused kernel reaches 59% of cuBLAS fp16 at 4096x4096 and 64% at
+4096x14336. Dequantising to fp16 and calling cuBLAS still reaches 99–100%, so
+at prefill **dequant-then-cuBLAS remains the better choice on time alone**. The
+fused kernel earns its place by never materialising the fp16 matrix — it saves
+the memory, which is the reason INT4 exists — and `ops.matmul` dispatches on
+batch size for the decode win rather than pretending otherwise.
 
-**The Triton baseline ties or wins here.** 111.7 TFLOP/s against this kernel's
-111.5 at 4096x4096, and 114.5 against 105.9 at 4096x14336. That is the expected
-shape of the result rather than an embarrassment: prefill is a well-trodden
-tiled-GEMM problem where an autotuner sweeping block sizes, warps and stages is
-hard to beat by hand in a few iterations. Decode is the opposite — an awkward,
-launch-geometry-sensitive, bandwidth-bound shape where `tl.dot`'s 16-row minimum
-tile wastes 15/16 of the work at M=1 — and there the CUDA kernel wins by 4.4x.
-Which regime rewards hand-written CUDA, and which does not, is the more useful
-finding than either number alone.
+Against the Triton baseline the kernel is now ahead in both regimes: 1.34x at
+prefill (150.0 vs 111.6 TFLOP/s) and 4.5x at decode. Before hypothesis 5 it was
+a dead heat at prefill, which was itself informative — prefill is a well-trodden
+tiled-GEMM problem where an autotuner sweeping block sizes is hard to beat by
+hand, and it took a structural change to the pipeline rather than a tuning knob
+to pull ahead. Decode is the opposite: an awkward, launch-geometry-sensitive,
+bandwidth-bound shape where `tl.dot`'s 16-row minimum tile wastes 15/16 of the
+work at M=1.
 
 ---
 
 ## What would come next
 
-1. **Deeper prefill pipeline.** The kernel is latency-bound at 24% occupancy
-   with two `cp.async` stages. Three or four stages, plus cutting the
-   128-register footprint to fit a third block per SM, is the remaining lever —
-   instruction count is not.
-2. **Fuse the split-K reduction.** A cooperative-groups grid sync or a
-   deterministic atomic reduction would remove one of the two launches, worth
-   ~3 us — around 20% on the smallest decode shapes.
-3. **`TN` as a tunable.** It is the one decode knob shown to change available
+1. **Deeper `cp.async` staging for activations.** The weight path is now
+   pipelined a tile ahead; the activation path is still a two-stage double
+   buffer. Three or four stages would give it the same cover.
+2. **Cut the 127-register footprint.** It is exactly at the boundary for 2
+   blocks per SM; fitting a third would lift occupancy from 24% to 36%.
+3. **Fuse the split-K reduction.** A cooperative-groups grid sync or a
+   deterministic atomic reduction would remove one of the two decode launches,
+   worth ~3 us — around 20% on the smallest decode shapes.
+4. **`TN` as a tunable.** It is the one decode knob shown to change available
    parallelism that is still hard-coded at 4.
-4. **Shared-memory swizzling instead of padding.** `LDB = BK + 8` happens to be
+5. **Shared-memory swizzling instead of padding.** `LDB = BK + 8` happens to be
    conflict-free for `ldmatrix` (see `csrc/mma.cuh`) but costs 20% of the tile's
-   shared footprint; an XOR swizzle would reclaim it.
-5. **Sub-group split-K.** Splits are capped at `K / group_size`; splitting
+   shared footprint; an XOR swizzle would reclaim it and help item 2.
+6. **Sub-group split-K.** Splits are capped at `K / group_size`; splitting
    inside a group would lift the cap that limits the narrow shapes.

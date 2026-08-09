@@ -88,6 +88,15 @@ __device__ __forceinline__ void load_A_tile(half* dst, const half* __restrict__ 
 // [BK][BN] is what turns 8 strided 2-byte stores into one vector store, and it
 // is also the layout ldmatrix wants.
 //
+// The staging is split into a *prefetch* (global -> register) and a *commit*
+// (register -> dequantise -> shared) so the two can sit a whole tile apart in
+// the pipeline. Activations already stream asynchronously through `cp.async`,
+// but the weight path has to round-trip through registers because the values
+// need decoding before they can be stored -- so without this split every thread
+// stalls on a full memory latency per tile, which is exactly the kind of
+// exposed latency the ncu occupancy numbers pointed at. Issuing the loads a
+// tile early gives them ~128 mma instructions of cover.
+//
 // GROUP is a template parameter rather than an argument for one reason: the
 // scale lookup needs `(k0 + r8*8) / GROUP`, and integer division by a *runtime*
 // value compiles to a multi-instruction sequence on the FMA pipe, executed once
@@ -95,24 +104,44 @@ __device__ __forceinline__ void load_A_tile(half* dst, const half* __restrict__ 
 // ncu pipe breakdown showed 64% of this kernel's instructions landing on the
 // ALU and FMA pipes -- integer address arithmetic, not math -- which is what
 // pointed here.
+//
+// Index arithmetic is done in 32-bit and widened only at the final offset;
+// widening first makes every address a 64-bit IMAD. `gemm_w4a16` checks the
+// shapes fit.
+constexpr int B_ITERS = (BK / 8) * BN / THREADS;  // packed words staged per thread
+
+struct BTile {
+  uint32_t q[B_ITERS];
+  half scale[B_ITERS];
+};
+
 template <int GROUP>
-__device__ __forceinline__ void load_B_tile(half* dst, const uint32_t* __restrict__ Wq,
-                                            const half* __restrict__ S, int n0, int k0, int N,
-                                            int tid) {
+__device__ __forceinline__ void prefetch_B_tile(BTile& p, const uint32_t* __restrict__ Wq,
+                                                const half* __restrict__ S, int n0, int k0, int N,
+                                                int tid) {
 #pragma unroll
-  for (int e = tid; e < (BK / 8) * BN; e += THREADS) {
-    const int r8 = e / BN;
-    const int c = e % BN;
+  for (int it = 0; it < B_ITERS; ++it) {
+    const int e = tid + it * THREADS;
+    const int r8 = e / BN, c = e % BN;
     const int n = n0 + c;
-    uint4 payload = make_uint4(0, 0, 0, 0);
-    if (n < N) {
-      const uint32_t q = Wq[static_cast<size_t>((k0 / 8 + r8) * N + n)];
-      const half sc = S[static_cast<size_t>(((k0 + r8 * 8) / GROUP) * N + n)];
-      half2 w[4];
-      dequant_8_scaled(q, sc, w);
-      payload = *reinterpret_cast<uint4*>(w);
-    }
-    *reinterpret_cast<uint4*>(dst + c * LDB + r8 * 8) = payload;
+    // Out-of-range columns load nothing and decode to zero via the zero scale
+    // below, which keeps the commit path branch-free.
+    p.q[it] = (n < N) ? Wq[static_cast<size_t>((k0 / 8 + r8) * N + n)] : 0u;
+    p.scale[it] =
+        (n < N) ? S[static_cast<size_t>(((k0 + r8 * 8) / GROUP) * N + n)] : __float2half(0.0f);
+  }
+}
+
+// No bounds test here: a masked-off column arrives with a zero scale, and
+// (q - 8) * 0 is zero, so padding falls out of the arithmetic for free.
+__device__ __forceinline__ void commit_B_tile(half* dst, const BTile& p, int tid) {
+#pragma unroll
+  for (int it = 0; it < B_ITERS; ++it) {
+    const int e = tid + it * THREADS;
+    const int r8 = e / BN, c = e % BN;
+    half2 w[4];
+    dequant_8_scaled(p.q[it], p.scale[it], w);
+    *reinterpret_cast<uint4*>(dst + c * LDB + r8 * 8) = *reinterpret_cast<uint4*>(w);
   }
 }
 
@@ -142,21 +171,31 @@ __global__ void gemm_v6_wmma(const half* __restrict__ X, const uint32_t* __restr
     for (int j = 0; j < FRAG_N; ++j) fill_fragment(c_frag[i][j], 0.0f);
 
   const int ntiles = K / BK;
+  BTile bp;
+  prefetch_B_tile<GROUP>(bp, Wq, S, n0, 0, N, tid);
+  commit_B_tile(Bs, bp, tid);
   load_A_tile<true>(As, X, m0, 0, M, K, tid);
-  load_B_tile<GROUP>(Bs, Wq, S, n0, 0, N, tid);
   cp_async_commit();
+  if (ntiles > 1) prefetch_B_tile<GROUP>(bp, Wq, S, n0, BK, N, tid);
 
   for (int t = 0; t < ntiles; ++t) {
     const int buf = t & 1;
     if (t + 1 < ntiles) {
       load_A_tile<true>(As + (buf ^ 1) * A_ELEMS, X, m0, (t + 1) * BK, M, K, tid);
-      load_B_tile<GROUP>(Bs + (buf ^ 1) * B_ELEMS, Wq, S, n0, (t + 1) * BK, N, tid);
       cp_async_commit();
       cp_async_wait_group<1>();
     } else {
       cp_async_wait_group<0>();
     }
     __syncthreads();
+
+    if (t + 1 < ntiles) {
+      // Safe to write the other buffer: everyone finished reading it at the
+      // trailing barrier of the previous iteration.
+      commit_B_tile(Bs + (buf ^ 1) * B_ELEMS, bp, tid);
+      // Clamped so the tail issues a harmless in-bounds load rather than a branch.
+      prefetch_B_tile<GROUP>(bp, Wq, S, n0, min(t + 2, ntiles - 1) * BK, N, tid);
+    }
 
     const half* Ab = As + buf * A_ELEMS;
     const half* Bb = Bs + buf * B_ELEMS;
@@ -253,21 +292,28 @@ __global__ void gemm_v7_mma(const half* __restrict__ X, const uint32_t* __restri
     b_base[g] = smem_u32(Bs + (warp_n + g * 16 + lrow) * LDB + lcol);
 
   const int ntiles = K / BK;
+  BTile bp;
+  prefetch_B_tile<GROUP>(bp, Wq, S, n0, 0, N, tid);
+  commit_B_tile(Bs, bp, tid);
   load_A_tile<true>(As, X, m0, 0, M, K, tid);
-  load_B_tile<GROUP>(Bs, Wq, S, n0, 0, N, tid);
   cp_async_commit();
+  if (ntiles > 1) prefetch_B_tile<GROUP>(bp, Wq, S, n0, BK, N, tid);
 
   for (int t = 0; t < ntiles; ++t) {
     const int buf = t & 1;
     if (t + 1 < ntiles) {
       load_A_tile<true>(As + (buf ^ 1) * A_ELEMS, X, m0, (t + 1) * BK, M, K, tid);
-      load_B_tile<GROUP>(Bs + (buf ^ 1) * B_ELEMS, Wq, S, n0, (t + 1) * BK, N, tid);
       cp_async_commit();
       cp_async_wait_group<1>();
     } else {
       cp_async_wait_group<0>();
     }
     __syncthreads();
+
+    if (t + 1 < ntiles) {
+      commit_B_tile(Bs + (buf ^ 1) * B_ELEMS, bp, tid);
+      prefetch_B_tile<GROUP>(bp, Wq, S, n0, min(t + 2, ntiles - 1) * BK, N, tid);
+    }
 
     const uint32_t a_off = buf * A_ELEMS * sizeof(half);
     const uint32_t b_off = buf * B_ELEMS * sizeof(half);

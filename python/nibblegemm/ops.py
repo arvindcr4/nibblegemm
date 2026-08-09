@@ -6,7 +6,7 @@ toolchain and the first call compiles.
 
 Note that ``--use_fast_math`` is deliberately *not* passed. It would let the
 compiler contract and reassociate float ops, which would make the accuracy
-numbers in tests/test_numerics.py describe a different kernel than the one being
+numbers in tests/test_gemv.py describe a different kernel than the one being
 benchmarked. The dequantisation path is already exact; there is nothing to gain.
 """
 from __future__ import annotations
@@ -85,7 +85,7 @@ def matmul(X: torch.Tensor, qw: QuantizedWeight, splits: int = 0,
 
     The crossover is not a tuning knob so much as a statement about which
     resource is saturated: below it the kernel is starved for bytes, above it for
-    tensor-core issue slots. bench/bench_crossover.py measures where the two
+    tensor-core issue slots. bench/bench_prefill.py measures where the two
     curves actually meet on this machine.
     """
     if X.dim() != 2:

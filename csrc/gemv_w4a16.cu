@@ -133,7 +133,7 @@ __global__ void gemv_v2_fastdq(const half* __restrict__ X, const uint32_t* __res
 // Accumulation is half2 within a short window then flushed to fp32. The window
 // (`FLUSH_WORDS` x 8 values) trades a little accuracy for packed-FMA
 // throughput; the group scale folds in at flush time, which removes a whole
-// accumulator array from the register budget. tests/test_numerics.py measures
+// accumulator array from the register budget. tests/test_gemv.py measures
 // what the window actually costs.
 // ---------------------------------------------------------------------------
 template <int MT, int GROUP, int THREADS, int FLUSH_WORDS>
